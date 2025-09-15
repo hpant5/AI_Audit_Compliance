@@ -1,4 +1,5 @@
 # AI_Audit_Compliance
+14/09/2025:
 
 Getting the bulk data from https://case.law/docs/
 (taking up to 100 years)
