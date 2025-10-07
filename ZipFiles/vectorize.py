@@ -236,7 +236,7 @@ class LegalCaseVectorDB:
             try:
                 self.process_state_folder(state_folder)
             except Exception as e:
-                print(f"\n❌ Error processing {state_folder.name}: {e}")
+                print(f"\n Error processing {state_folder.name}: {e}")
                 continue
         
         end_count = self.collection.count()
