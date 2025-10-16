@@ -1,7 +1,7 @@
 Overview
 
 The AI Audit Compliance system automates the collection, organization, and analysis of U.S. legal data to support audit and compliance workflows.
-It includes automated data ingestion from public legal sources, structured data storage, and an AI-driven multi-agent chatbot capable of contextual legal reasoning, document retrieval, and risk scoring.
+It includes data ingestion from public legal sources, structured data storage, and an AI-driven multi-agent chatbot capable of contextual legal reasoning, document retrieval, and risk scoring.
 
 Data Acquisition and Organization
 
@@ -18,12 +18,9 @@ State_Name/
          └── <case_files>.html
 
 
-Example: Alaska/1950/case_001.html
-
 Current coverage: Alaska → Mississippi
 
 Both federal and state law datasets are stored in the shared repository.
-(Drive link will be provided here once upload completes.)
 
 Chatbot System Design
 
