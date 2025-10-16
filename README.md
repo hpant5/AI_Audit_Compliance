@@ -1,28 +1,74 @@
-# AI_Audit_Compliance
-14/09/2025:
+Overview
 
-Getting the bulk data from https://case.law/docs/
-(taking up to 100 years)
+The AI Audit Compliance system automates the collection, organization, and analysis of U.S. legal data to support audit and compliance workflows.
+It includes automated data ingestion from public legal sources, structured data storage, and an AI-driven multi-agent chatbot capable of contextual legal reasoning, document retrieval, and risk scoring.
 
-after downloading the data, tranfer to the drive and share the link below 
-Format -- State name -- inside the state folder, year name and then the files for that year ( html ) 
-Alaska to mississippi :-
-----
+Data Acquisition and Organization
 
-save the federal and state law data in the drive : (link) 
+Source: Case.Law Documentation
 
---- 
-chat bot [ this chat bot will answer question based on the data ( from the links ) it will switch to the relevant folder and scan the files within. it will give the analysis based on demand request, this will also 
-analyse the question and give a risk factor to the user the chat bot will also give the file to the user which will tell them the next steps ]
+Extracting bulk legal data spanning up to 100 years of U.S. case law.
 
-Chatbot : this will have multiple agents 
-one data ingestion agent whill take the pdf/doc file from the user and read it and explain it to the chat bot. 
-the chat bot will take input from the user and then use the proof finding agent, the proof finding agent will read the relevant files from the folder and find answers to the question shared by the chat bot 
-risk scoring agent based on the answer by the proof finding agent another agent will give a score and a sentinet ansewer to the chat bot which will tell the user what to do next 
+After download, data is organized and transferred to a shared drive for processing.
 
----
+Directory structure:
+
+State_Name/
+    └── Year/
+         └── <case_files>.html
 
 
+Example: Alaska/1950/case_001.html
 
+Current coverage: Alaska → Mississippi
 
+Both federal and state law datasets are stored in the shared repository.
+(Drive link will be provided here once upload completes.)
 
+Chatbot System Design
+
+A multi-agent AI chatbot provides on-demand legal insights, context-aware analysis, and automated risk evaluation based on the ingested legal data.
+
+Core Capabilities
+
+Answers user questions by dynamically navigating through relevant state or federal data folders.
+
+Generates concise analyses and context-based legal insights.
+
+Assigns a risk factor score based on the sensitivity and implications of the query.
+
+Delivers actionable next steps and links to supporting documents.
+
+Multi-Agent Architecture
+
+Data Ingestion Agent
+
+Accepts uploaded PDFs or DOC files from users.
+
+Parses and summarizes documents.
+
+Passes extracted content to the Chatbot Agent for integration.
+
+Proof-Finding Agent
+
+Receives queries or context from the Chatbot Agent.
+
+Searches relevant folders and scans HTML files to locate supporting evidence.
+
+Returns cited excerpts and structured reasoning.
+
+Risk Scoring Agent
+
+Evaluates responses from the Proof-Finding Agent.
+
+Assigns a compliance risk score and produces a sentiment-based summary.
+
+Informs the Chatbot Agent of potential red flags or recommended next steps.
+
+Chatbot Agent (Orchestrator)
+
+Serves as the user interface.
+
+Coordinates between agents to answer questions, reference supporting files, and provide actionable insights.
+
+Returns final analysis, risk assessment, and relevant file links to the user.
