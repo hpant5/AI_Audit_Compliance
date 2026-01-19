@@ -1,162 +1,351 @@
 import os
 import chromadb
+from chromadb.utils import embedding_functions
+from bs4 import BeautifulSoup
 from pathlib import Path
-from typing import List, Dict
+from typing import Dict
 import hashlib
 from tqdm import tqdm
-import PyPDF2
+import time
 import re
 
-class FederalLawIngestion:
-    def __init__(self, chroma_db_path="./chroma_legal_db"):
-        """Initialize ChromaDB for federal laws"""
-        print("Initializing ChromaDB for federal laws...")
+class LegalCaseVectorDB:
+    def __init__(self, chroma_db_path="./chroma_legal_db", use_azure_for_classification=True):
+        """
+        Initialize Chroma database with Legal-BERT embeddings
         
+        Args:
+            chroma_db_path: Path to ChromaDB storage
+            use_azure_for_classification: Use Azure OpenAI for case type classification
+        """
+        print("Initializing Chroma database with Legal-BERT...")
+        
+        # Create persistent Chroma client
         self.client = chromadb.PersistentClient(path=chroma_db_path)
         
-        # Separate collection for federal laws
-        self.collection = self.client.get_or_create_collection(
-            name="federal_laws",
-            metadata={"description": "Federal law documents"}
+        # Use Legal-BERT for embeddings
+        legal_bert_ef = embedding_functions.SentenceTransformerEmbeddingFunction(
+            model_name="nlpaueb/legal-bert-base-uncased"
         )
         
-        print(f"Federal laws collection initialized")
-        print(f"Current documents: {self.collection.count()}\n")
-    
-    def extract_text_from_pdf(self, pdf_path: Path) -> str:
-        """Extract text from PDF file"""
-        try:
-            text = ""
-            with open(pdf_path, 'rb') as file:
-                pdf_reader = PyPDF2.PdfReader(file)
+        # Create or get collection for legal cases
+        self.collection = self.client.get_or_create_collection(
+            name="legal_cases_bert",
+            embedding_function=legal_bert_ef,
+            metadata={"description": "Legal cases with Legal-BERT embeddings"}
+        )
+        
+        # Initialize Azure OpenAI for case classification if enabled
+        self.use_llm_classification = use_azure_for_classification
+        if use_azure_for_classification:
+            try:
+                from langchain_openai import AzureChatOpenAI
+                AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+                AZURE_OPENAI_API_KEY = os.getenv("AZURE_OPENAI_API_KEY")
+                AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+                AZURE_OPENAI_API_VERSION = os.getenv("AZURE_OPENAI_API_VERSION")
                 
-                for page_num, page in enumerate(pdf_reader.pages):
-                    try:
-                        page_text = page.extract_text()
-                        if page_text:
-                            text += f"\n[Page {page_num + 1}]\n{page_text}"
-                    except Exception as e:
-                        print(f"Error extracting page {page_num + 1}: {e}")
-                        continue
+                self.llm = AzureChatOpenAI(
+                    azure_endpoint=AZURE_OPENAI_ENDPOINT,
+                    api_key=AZURE_OPENAI_API_KEY,
+                    azure_deployment=AZURE_OPENAI_DEPLOYMENT,
+                    api_version=AZURE_OPENAI_API_VERSION,
+                    temperature=0.1,
+                )
+                print("✓ Azure OpenAI initialized for case type classification")
+            except Exception as e:
+                print(f"⚠ Could not initialize Azure OpenAI: {e}")
+                print("  Will use keyword-based classification as fallback")
+                self.llm = None
+                self.use_llm_classification = False
+        
+        print(f"✓ Chroma database initialized at: {chroma_db_path}")
+        print(f"✓ Using embedding model: nlpaueb/legal-bert-base-uncased")
+        print(f"✓ Current documents in collection: {self.collection.count()}")
+    
+    def detect_case_type(self, text: str, use_llm: bool = True) -> str:
+        """
+        Automatically detect case type using Azure OpenAI or keyword fallback
+        """
+        if use_llm and hasattr(self, 'llm'):
+            try:
+                # Use LLM for classification
+                prompt = f"""Classify this legal case into ONE of these categories:
+- Criminal - DUI
+- Criminal
+- Family Law
+- Employment
+- Property/Real Estate
+- Corporate/Business
+- Tort/Personal Injury
+- Contract
+- Administrative
+- Tax
+- Bankruptcy
+- Civil
+- General
+
+Case text (first 1000 chars):
+{text[:1000]}
+
+Respond with ONLY the category name, nothing else."""
+                
+                from langchain_core.messages import HumanMessage
+                response = self.llm.invoke([HumanMessage(content=prompt)])
+                case_type = response.content.strip()
+                
+                # Validate response
+                valid_types = [
+                    "Criminal - DUI", "Criminal", "Family Law", "Employment",
+                    "Property/Real Estate", "Corporate/Business", "Tort/Personal Injury",
+                    "Contract", "Administrative", "Tax", "Bankruptcy", "Civil", "General"
+                ]
+                
+                if case_type in valid_types:
+                    return case_type
+                    
+            except Exception as e:
+                print(f"LLM classification failed, using keyword fallback: {e}")
+        
+        # Keyword fallback
+        text_lower = text.lower()
+        
+        if any(k in text_lower for k in ["dui", "d.u.i", "driving under the influence"]):
+            return "Criminal - DUI"
+        if any(k in text_lower for k in ["criminal", "defendant", "prosecution"]):
+            return "Criminal"
+        if any(k in text_lower for k in ["divorce", "custody", "child support"]):
+            return "Family Law"
+        if any(k in text_lower for k in ["employment", "wrongful termination"]):
+            return "Employment"
+        if any(k in text_lower for k in ["real property", "easement", "landlord"]):
+            return "Property/Real Estate"
+        if any(k in text_lower for k in ["shareholder", "corporate", "fiduciary duty"]):
+            return "Corporate/Business"
+        if any(k in text_lower for k in ["negligence", "personal injury", "malpractice"]):
+            return "Tort/Personal Injury"
+        if any(k in text_lower for k in ["breach of contract", "contractual"]):
+            return "Contract"
+        if any(k in text_lower for k in ["plaintiff", "damages"]):
+            return "Civil"
+        
+        return "General"
+    
+    def parse_html_case(self, html_path: Path, state: str = "Unknown") -> Dict:
+        """
+        Extract full case content and metadata - ONE chunk per case
+        
+        Args:
+            html_path: Path to HTML file
+            state: State name (for court inference)
+        """
+        try:
+            with open(html_path, 'r', encoding='utf-8', errors='ignore') as f:
+                html_content = f.read()
             
-            # Clean text
-            text = re.sub(r'\s+', ' ', text)
-            text = re.sub(r'\n+', '\n', text)
+            soup = BeautifulSoup(html_content, 'lxml')
             
-            return text.strip()
+            # Extract metadata
+            metadata = {}
+            
+            # Case name (parties)
+            parties = soup.find('h4', class_='parties')
+            if parties:
+                case_name = parties.get_text(strip=True)
+                case_name = re.sub(r'[â€ ]', '', case_name)
+                case_name = case_name.split('\n')[0].split(',')[0:2]
+                metadata['case_name'] = ', '.join(case_name) if len(case_name) > 1 else case_name[0]
+            else:
+                title = soup.find('title')
+                metadata['case_name'] = title.get_text(strip=True) if title else html_path.stem
+            
+            # Decision date - use regex to extract date from text
+            decision_date_elem = soup.find('p', class_='decisiondate')
+            if decision_date_elem:
+                date_text = decision_date_elem.get_text(strip=True)
+                # Extract date using regex pattern
+                date_pattern = r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\b'
+                dates = re.findall(date_pattern, date_text)
+                metadata['decision_date'] = dates[0] if dates else date_text
+            else:
+                # Fallback: search in full text
+                date_pattern = r'\b(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}\b'
+                full_text_preview = soup.get_text()[:1000]
+                dates = re.findall(date_pattern, full_text_preview)
+                metadata['decision_date'] = dates[0] if dates else 'Unknown'
+            
+            # Court - For Arizona, extract from docket number area or infer from state
+            court = soup.find('p', class_='court')
+            if court:
+                metadata['court'] = court.get_text(strip=True)
+            else:
+                # Arizona doesn't have court element, infer from docket or use default
+                docket = soup.find('p', class_='docketnumber')
+                if docket:
+                    docket_text = docket.get_text(strip=True).lower()
+                    if 'civil' in docket_text:
+                        metadata['court'] = f"{state} Superior Court"
+                    elif 'criminal' in docket_text:
+                        metadata['court'] = f"{state} Superior Court - Criminal"
+                    else:
+                        metadata['court'] = f"{state} Court"
+                else:
+                    # Last resort: check body text for court mentions
+                    body_preview = soup.get_text()[:500].lower()
+                    if 'supreme court' in body_preview:
+                        metadata['court'] = f"{state} Supreme Court"
+                    elif 'court of appeals' in body_preview or 'appellate' in body_preview:
+                        metadata['court'] = f"{state} Court of Appeals"
+                    else:
+                        metadata['court'] = f"{state} Court"
+            
+            # Citation
+            citation = soup.find('p', class_='citation')
+            metadata['citation'] = citation.get_text(strip=True) if citation else 'Unknown'
+            
+            # Extract ALL text content from the case
+            # Remove script, style, and navigation elements
+            for element in soup(['script', 'style', 'nav', 'header', 'footer']):
+                element.decompose()
+            
+            # Get all text from the case body
+            case_section = soup.find('section', class_='casebody')
+            if case_section:
+                full_text = case_section.get_text(separator=' ', strip=True)
+            else:
+                # Fallback to entire body
+                full_text = soup.get_text(separator=' ', strip=True)
+            
+            # Clean the text
+            full_text = re.sub(r'\s+', ' ', full_text)
+            full_text = re.sub(r'[â€ ]+', '', full_text)
+            full_text = re.sub(r'\u200b', '', full_text)  # Zero-width space
+            full_text = re.sub(r'\xa0', ' ', full_text)   # Non-breaking space
+            full_text = full_text.strip()
+            
+            # Limit text length (ChromaDB has limits, typically 8191 tokens for BERT)
+            # ~4000 words = ~5000 tokens (safe limit)
+            words = full_text.split()
+            if len(words) > 4000:
+                full_text = ' '.join(words[:4000]) + '...'
+            
+            if len(full_text) < 100:
+                return None
+            
+            # Detect case type from content (using Azure OpenAI if available)
+            case_type = self.detect_case_type(full_text, use_llm=self.use_llm_classification)
+            
+            return {
+                'case_name': metadata['case_name'],
+                'decision_date': metadata['decision_date'],
+                'court': metadata['court'],
+                'citation': metadata['citation'],
+                'case_type': case_type,  # Auto-detected
+                'content': full_text,
+                'file_path': str(html_path),
+                'file_name': html_path.name
+            }
             
         except Exception as e:
-            print(f"Error reading PDF {pdf_path}: {e}")
+            print(f"Error parsing {html_path}: {e}")
             return None
     
-    def chunk_text(self, text: str, chunk_size: int = 1500, overlap: int = 300) -> List[str]:
-        """Split text into overlapping chunks"""
-        if not text or len(text) == 0:
-            return []
-        
-        chunks = []
-        start = 0
-        text_length = len(text)
-        
-        while start < text_length:
-            end = start + chunk_size
-            
-            # Try to break at sentence boundary
-            if end < text_length:
-                for punct in ['. ', '.\n', '! ', '? ']:
-                    punct_pos = text.rfind(punct, end - 200, end + 200)
-                    if punct_pos != -1:
-                        end = punct_pos + len(punct)
-                        break
-            
-            chunk = text[start:end].strip()
-            
-            if chunk and len(chunk) > 100:
-                chunks.append(chunk)
-            
-            start = end - overlap if end < text_length else text_length
-        
-        return chunks
+    def generate_case_id(self, file_path: str) -> str:
+        """Generate unique ID for each case"""
+        return hashlib.md5(file_path.encode()).hexdigest()
     
-    def process_pdf_folder(self, pdf_folder: Path, batch_size: int = 50):
-        """Process all PDFs in a folder"""
+    def process_single_folder(self, folder_path: Path, batch_size=50):
+        """
+        Process a single state/case type folder
+        ONE CHUNK PER CASE
         
-        if not pdf_folder.exists():
-            print(f"Error: Folder {pdf_folder} not found!")
-            return
+        Args:
+            folder_path: Path to specific folder (e.g., Laws/samoa)
+            batch_size: Number of cases to batch before inserting
+        """
+        if not folder_path.exists():
+            print(f"ERROR: Folder '{folder_path}' not found!")
+            return None
         
-        # Find all PDFs
-        pdf_files = list(pdf_folder.glob('**/*.pdf'))
+        print(f"\n{'='*70}")
+        print(f"PROCESSING: {folder_path.name}")
+        print(f"{'='*70}\n")
         
-        if not pdf_files:
-            print(f"No PDF files found in {pdf_folder}")
-            return
+        # Find all HTML files in this specific folder
+        html_files = list(folder_path.glob('**/*.html')) + list(folder_path.glob('**/*.htm'))
         
-        print(f"\nFound {len(pdf_files)} PDF files")
-        print(f"Processing...\n")
+        if not html_files:
+            print(f"No HTML files found in {folder_path}")
+            return None
         
+        print(f"Found {len(html_files):,} HTML files")
+        
+        # Extract state from path - FIXED: use -1 instead of -2
+        path_parts = folder_path.parts
+        state = path_parts[-1] if len(path_parts) >= 1 else 'Unknown'
+        
+        print(f"State: {state}\n")
+        print("Note: Case types will be auto-detected from document content\n")
+        
+        # Start timing
+        start_time = time.time()
+        
+        # Prepare batches
         documents = []
         metadatas = []
         ids = []
         
-        total_chunks = 0
-        files_processed = 0
-        files_skipped = 0
+        cases_processed = 0
+        cases_skipped = 0
         
-        for pdf_file in tqdm(pdf_files, desc="Processing PDFs"):
-            # Extract text
-            text = self.extract_text_from_pdf(pdf_file)
+        print("Starting processing...\n")
+        
+        # Process each HTML file - ONE CHUNK PER CASE
+        for html_file in tqdm(html_files, desc="Processing cases"):
+            # Parse entire case (pass state for court inference)
+            case_data = self.parse_html_case(html_file, state=state)
             
-            if not text or len(text) < 100:
-                files_skipped += 1
+            if not case_data:
+                cases_skipped += 1
                 continue
             
-            # Chunk text
-            chunks = self.chunk_text(text, chunk_size=1500, overlap=300)
+            cases_processed += 1
             
-            if not chunks:
-                files_skipped += 1
-                continue
+            # Generate unique ID for this case
+            case_id = self.generate_case_id(str(html_file))
             
-            files_processed += 1
+            # Add case to batch
+            documents.append(case_data['content'])
+            metadatas.append({
+                'state': state,
+                'case_name': case_data['case_name'],
+                'case_type': case_data['case_type'],  # Now auto-detected
+                'decision_date': case_data['decision_date'],
+                'court': case_data['court'],  # Added court field
+                'citation': case_data['citation'],  # Added citation field
+                'file_name': case_data['file_name'],
+                'file_path': case_data['file_path']
+            })
+            ids.append(case_id)
             
-            # Get law title from filename
-            law_title = pdf_file.stem.replace('_', ' ').replace('-', ' ')
-            
-            # Add chunks to batch
-            for chunk_idx, chunk in enumerate(chunks):
-                chunk_id = hashlib.md5(
-                    f"{pdf_file.name}_{chunk_idx}".encode()
-                ).hexdigest()
-                
-                documents.append(chunk)
-                metadatas.append({
-                    'source': 'federal_law',
-                    'law_title': law_title,
-                    'file_name': pdf_file.name,
-                    'file_path': str(pdf_file),
-                    'chunk_index': chunk_idx,
-                    'total_chunks': len(chunks)
-                })
-                ids.append(chunk_id)
-                total_chunks += 1
-                
-                # Insert batch
-                if len(documents) >= batch_size:
-                    try:
-                        self.collection.add(
-                            documents=documents,
-                            metadatas=metadatas,
-                            ids=ids
-                        )
-                        documents, metadatas, ids = [], [], []
-                    except Exception as e:
-                        print(f"\nError inserting batch: {e}")
-                        documents, metadatas, ids = [], [], []
+            # Insert batch when it reaches batch_size
+            if len(documents) >= batch_size:
+                try:
+                    print(f"  Inserting batch of {len(documents)} cases...")
+                    self.collection.add(
+                        documents=documents,
+                        metadatas=metadatas,
+                        ids=ids
+                    )
+                    documents, metadatas, ids = [], [], []
+                except Exception as e:
+                    print(f"\nError inserting batch: {e}")
+                    documents, metadatas, ids = [], [], []
         
-        # Insert remaining
+        # Insert remaining documents
         if documents:
             try:
+                print(f"  Inserting final batch of {len(documents)} cases...")
                 self.collection.add(
                     documents=documents,
                     metadatas=metadatas,
@@ -165,28 +354,109 @@ class FederalLawIngestion:
             except Exception as e:
                 print(f"\nError inserting final batch: {e}")
         
+        # End timing
+        end_time = time.time()
+        processing_time = end_time - start_time
+        
+        # Print results
         print(f"\n{'='*70}")
-        print(f"FEDERAL LAW INGESTION COMPLETE")
-        print(f"{'='*70}")
-        print(f"Files processed:  {files_processed}")
-        print(f"Files skipped:    {files_skipped}")
-        print(f"Total chunks:     {total_chunks}")
-        print(f"In database:      {self.collection.count()}")
+        print(f"PROCESSING COMPLETE")
         print(f"{'='*70}\n")
         
+        print(f"STATISTICS:")
+        print(f"  Cases processed:        {cases_processed:,}")
+        print(f"  Cases skipped:          {cases_skipped:,}")
+        print(f"  Total in DB:            {self.collection.count():,}")
+        print(f"  Chunks per case:        1 (full case per chunk)\n")
+        
+        print(f"TIMING:")
+        print(f"  Total time:             {processing_time:.2f} seconds ({processing_time/60:.2f} minutes)")
+        print(f"  Time per case:          {processing_time/cases_processed if cases_processed > 0 else 0:.3f} seconds")
+        print(f"  Cases per minute:       {cases_processed/(processing_time/60) if processing_time > 0 else 0:.1f}\n")
+        
         return {
-            'files_processed': files_processed,
-            'total_chunks': total_chunks
+            'cases_processed': cases_processed,
+            'processing_time': processing_time
         }
+    
+    def search(self, query: str, n_results: int = 5, state_filter: str = None):
+        """
+        Search for relevant legal cases
+        
+        Args:
+            query: Search query
+            n_results: Number of results to return
+            state_filter: Optional state filter
+        """
+        where_filter = {"state": state_filter} if state_filter else None
+        
+        results = self.collection.query(
+            query_texts=[query],
+            n_results=n_results,
+            where=where_filter
+        )
+        
+        return results
+    
+    def test_search(self):
+        """
+        Test search functionality with sample queries
+        """
+        print(f"\n{'='*70}")
+        print(f"TESTING SEARCH FUNCTIONALITY")
+        print(f"{'='*70}\n")
+        
+        test_queries = [
+            "breach of fiduciary duty",
+            "contract dispute",
+            "employment termination"
+        ]
+        
+        for query in test_queries:
+            print(f"Query: '{query}'")
+            print(f"  {'-'*66}")
+            
+            results = self.search(query, n_results=3)
+            
+            if results['documents'][0]:
+                for i, (doc, metadata) in enumerate(zip(results['documents'][0], results['metadatas'][0])):
+                    print(f"\n  Result #{i+1}:")
+                    print(f"    Case: {metadata['case_name']}")
+                    print(f"    State: {metadata['state']}")
+                    print(f"    Case Type: {metadata['case_type']}")
+                    print(f"    Date: {metadata['decision_date']}")
+                    print(f"    Preview: {doc[:300]}...")
+            else:
+                print("  No results found.")
+            
+            print("\n")
 
 
 def main():
-    ingestion = FederalLawIngestion(chroma_db_path="./chroma_legal_db")
+    """
+    Main execution - Process single folder only
+    """
+    print("\n" + "="*70)
+    print("LEGAL CASE VECTORIZATION - Legal-BERT")
+    print("One Chunk Per Case with Auto Case Type Detection")
+    print("="*70 + "\n")
     
-    # Path to your federal law PDFs
-    pdf_folder = Path("C:/Users/hardi/Downloads/Federal law")
+    # Initialize vector database with Legal-BERT
+    vector_db = LegalCaseVectorDB(chroma_db_path="./chroma_legal_db")
     
-    ingestion.process_pdf_folder(pdf_folder, batch_size=50)
+    # SPECIFY YOUR FOLDER HERE
+    target_folder = Path("C:/Users/hardi/Downloads/testing/New Mexico")
+    
+    # Process the single folder
+    stats = vector_db.process_single_folder(target_folder, batch_size=50)
+    
+    # Test search if data was processed
+    if stats and stats['cases_processed'] > 0:
+        vector_db.test_search()
+    
+    print("\n" + "="*70)
+    print("COMPLETE!")
+    print("="*70 + "\n")
 
 
 if __name__ == "__main__":
